@@ -135,6 +135,16 @@ def load_jangtq_model(model_path, skip_params_eval=False):
     """
     _apply_wired_limit_safe_default()
 
+    # JANGTQ stores per-expert weights unfused (separate gate_proj/up_proj).
+    # oMLX's GLM-5.2 module fuses them into gate_up_proj by default, which
+    # would leave the TQ hydrator with no target module, so opt out before
+    # the model is constructed. No-op when oMLX is not installed.
+    try:
+        from omlx.patches.glm_moe_dsa import deepseek_v32 as _omlx_dsv32
+        _omlx_dsv32.FUSED_GATE_UP_OVERRIDE = False
+    except Exception:
+        pass
+
     model_path = Path(model_path)
     # M125 (iter 48): context-manage reads so fds close deterministically.
     with open(model_path / "config.json") as f:
@@ -1099,7 +1109,7 @@ def _hydrate_jangtq_model(model, model_path, mxtq_seed, mxtq_bits_map,
     # the fused layout (oMLX glm_moe_dsa optimized module). Concat along the
     # output-row axis (axis=1 for [n_experts, out, packed_in]); codebooks and
     # Hadamard signs are keyed by (input_dim, bits) so they are unaffected.
-    if os.environ.get("JANGTQ_FUSE_GATE_UP", "1") != "0":
+    if os.environ.get("JANGTQ_FUSE_GATE_UP", "0") == "1":
         _fused = 0
         for _base in [b for b in tq_groups if b.endswith("switch_mlp.gate_proj")]:
             _prefix = _base[: -len("gate_proj")]

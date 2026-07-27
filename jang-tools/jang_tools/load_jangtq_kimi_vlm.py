@@ -222,6 +222,12 @@ def _warmup_jit_per_layer(model, verbose: bool = True) -> None:
                 x = layer(x, mask=None, cache=None)
             except TypeError:
                 x = layer(x)
+        # GLM-5.2 (glm_moe_dsa) decoder layers return (hidden, topk_indices)
+        # so shared-indexer layers can reuse the previous layer's top-k.
+        # Unwrap regardless of which call signature succeeded, or the next
+        # layer's input_layernorm receives a tuple.
+        if isinstance(x, tuple):
+            x = x[0]
         _materialize(x)
         _mx.synchronize()
         if verbose and (i % 10 == 0 or i == len(layers) - 1):

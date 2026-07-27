@@ -302,6 +302,9 @@ def load_jangtq_model(model_path, skip_params_eval=False):
         _warmup_jit_per_layer(model)
         _warmed = True
     except Exception as _e:
+        import os as _os_dbg
+        if _os_dbg.environ.get("JANGTQ_WARMUP_TRACE", "") == "1":
+            import traceback; traceback.print_exc()
         print(f"  [warmup] per-layer skipped ({type(_e).__name__}: {_e}); "
               f"trying full-model 1-token forward", flush=True)
 

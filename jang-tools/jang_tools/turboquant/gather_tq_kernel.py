@@ -588,6 +588,49 @@ def gather_tq_matmul(
             if os.environ.get("JANGTQ_MPP_NAX_STRICT", "").strip() == "1":
                 raise
 
+    if os.environ.get("JANGTQ_STEEL_DEBUG", "") == "1":
+        print(f"[tq] kind={out_shape_kind} batch={batch} K={K} idx_ndim={rhs_indices.ndim} out={out_features}", flush=True)
+
+    # Broadcast path (gate/up during prefill): x is (tokens, in_f) with
+    # indices (tokens, K), so rows are not grouped by expert. Sort the
+    # token-expert pairs, run the grouped GEMM, then invert the permutation.
+    # Worth it above a few hundred rows: the steel kernel is ~3.8x the
+    # per-row kernel at N=4096, and an argsort plus two gathers is cheap.
+    if (
+        out_shape_kind == "broadcast"
+        and batch * K >= int(os.environ.get("JANGTQ_STEEL_MIN_ROWS", "256"))
+    ):
+        try:
+            from .steel_tq import grouped_matmul as _steel, available as _have
+            if _have():
+                order = mx.argsort(idx_flat)
+                idx_sorted = idx_flat[order]
+                rows = order // K                      # token index per pair
+                x_sorted = mx.take(x_rot, rows, axis=0)
+                y_sorted = _steel(x_sorted, packed, norms, codebook, idx_sorted, bits)
+                if y_sorted is not None:
+                    inv = mx.argsort(order)
+                    out = mx.take(y_sorted, inv, axis=0)
+                    out = out.reshape(batch, K, 1, out_features)
+                    return out.astype(x.dtype) if out.dtype != x.dtype else out
+        except Exception:
+            if os.environ.get("JANGTQ_STEEL_STRICT", "") == "1":
+                raise
+
+    # Steel-tiled grouped GEMM for the sorted (prefill) path: amortizes the
+    # expert weight read across a BM-row block instead of re-reading it per
+    # token. Decode (per_row / broadcast) keeps the existing kernel.
+    if out_shape_kind == "sorted":
+        try:
+            from .steel_tq import grouped_matmul as _steel
+            _out = _steel(x_rot, packed, norms, codebook, idx_flat, bits)
+            if _out is not None:
+                _out = _out.reshape(batch, 1, out_features)
+                return _out.astype(x.dtype) if _out.dtype != x.dtype else _out
+        except Exception:
+            if os.environ.get("JANGTQ_STEEL_STRICT", "") == "1":
+                raise
+
     # Run kernel
     kernel = _get_kernel()
 

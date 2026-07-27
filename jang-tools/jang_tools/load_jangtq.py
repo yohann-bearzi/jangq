@@ -794,8 +794,43 @@ def _hydrate_dsv4_jangtq_streaming(
         try:
             from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _OmlxSwitchGLU
             if _OmlxSwitchGLU is not SwitchGLU:
-                _OmlxSwitchGLU.__call__ = _dsv4_fused_switchglu_call
-                print("  Patched oMLX vendored SwitchGLU for fused gate+up", flush=True)
+                # Keep oMLX's own implementation as the fallback: its sorted
+                # prefill path reaches the steel grouped GEMM for all three
+                # projections, while the fused kernel below still owns decode
+                # (can_fast requires batch == 1). Falling back to mlx_lm's
+                # version instead hid gate/up from the steel path and cost
+                # ~45% of prefill throughput.
+                _omlx_orig_call = _OmlxSwitchGLU.__call__
+
+                def _omlx_fused_call(self, x, indices, *a, **kw):
+                    gp = getattr(self, "gate_proj", None)
+                    up = getattr(self, "up_proj", None)
+                    x_sq = x
+                    while x_sq.ndim > 2 and x_sq.shape[-2] == 1:
+                        x_sq = x_sq.squeeze(-2)
+                    batch_rows = x_sq.reshape(-1, x_sq.shape[-1]).shape[0]
+                    # oMLX passes scores=/weighted_sum= at decode; the fused
+                    # kernel returns the unreduced (K, out) tile, which is what
+                    # the caller expects when weighted_sum is False/None.
+                    if os.environ.get("JANGTQ_FUSE_DEBUG", "") == "1":
+                        print(f"[fuse] rows={batch_rows} gp={type(gp).__name__} "
+                              f"up={type(up).__name__} a={len(a)} kw={list(kw)}",
+                              flush=True)
+                    _scores = kw.get("scores")
+                    _wsum = kw.get("weighted_sum", False)
+                    if (
+                        batch_rows == 1
+                        and isinstance(gp, TurboQuantSwitchLinear)
+                        and isinstance(up, TurboQuantSwitchLinear)
+                        and not a
+                        and _scores is None
+                        and not _wsum
+                    ):
+                        return _dsv4_fused_switchglu_call(self, x, indices)
+                    return _omlx_orig_call(self, x, indices, *a, **kw)
+
+                _OmlxSwitchGLU.__call__ = _omlx_fused_call
+                print("  Patched oMLX vendored SwitchGLU (fused decode, native prefill)", flush=True)
         except Exception as _e:
             pass
         patched = sum(
@@ -1450,6 +1485,43 @@ def _hydrate_jangtq_model(model, model_path, mxtq_seed, mxtq_bits_map,
 
         _ORIG_SWITCHGLU_CALL = SwitchGLU.__call__
         SwitchGLU.__call__ = _fused_switchglu_call
+        # oMLX vendors its own SwitchGLU (same name, different module), so the
+        # class-level patch above never reaches GLM-5.2 models loaded under the
+        # optimized module. Wrap it: fused kernel at decode (batch == 1), oMLX's
+        # native implementation otherwise -- its sorted prefill path reaches the
+        # steel grouped GEMM for gate/up/down, worth ~45% of prefill throughput.
+        try:
+            from omlx.patches.glm_moe_dsa.switch_layers import (
+                SwitchGLU as _OmlxSGLU,
+            )
+            if _OmlxSGLU is not SwitchGLU:
+                _omlx_orig = _OmlxSGLU.__call__
+
+                def _omlx_dispatch(self, x, indices, *a, **kw):
+                    gp = getattr(self, "gate_proj", None)
+                    up = getattr(self, "up_proj", None)
+                    xs = x
+                    while xs.ndim > 2 and xs.shape[-2] == 1:
+                        xs = xs.squeeze(-2)
+                    rows = xs.reshape(-1, xs.shape[-1]).shape[0]
+                    if os.environ.get("JANGTQ_FUSE_DEBUG", "") == "1":
+                        print(f"[fuse] rows={rows} gp={type(gp).__name__} "
+                              f"a={len(a)} kw={list(kw)}", flush=True)
+                    if (
+                        rows == 1
+                        and not a
+                        and kw.get("scores") is None
+                        and not kw.get("weighted_sum", False)
+                        and isinstance(gp, TurboQuantSwitchLinear)
+                        and isinstance(up, TurboQuantSwitchLinear)
+                    ):
+                        return _fused_switchglu_call(self, x, indices)
+                    return _omlx_orig(self, x, indices, *a, **kw)
+
+                _OmlxSGLU.__call__ = _omlx_dispatch
+                print("  Patched oMLX vendored SwitchGLU (fused decode, native prefill)", flush=True)
+        except Exception:
+            pass
 
         # Count how many instances will benefit
         patched = sum(

@@ -787,6 +787,17 @@ def _hydrate_dsv4_jangtq_streaming(
             return x_out.squeeze(-2)
 
         SwitchGLU.__call__ = _dsv4_fused_switchglu_call
+        # Also patch oMLX's vendored SwitchGLU (same name, different module):
+        # omlx.patches.glm_moe_dsa.switch_layers.SwitchGLU is a distinct class,
+        # so the class-level patch above does not reach GLM-5.2 models loaded
+        # under the oMLX optimized module.
+        try:
+            from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _OmlxSwitchGLU
+            if _OmlxSwitchGLU is not SwitchGLU:
+                _OmlxSwitchGLU.__call__ = _dsv4_fused_switchglu_call
+                print("  Patched oMLX vendored SwitchGLU for fused gate+up", flush=True)
+        except Exception as _e:
+            pass
         patched = sum(
             1 for _, m in model.named_modules()
             if isinstance(m, SwitchGLU)
@@ -1045,6 +1056,38 @@ def _hydrate_jangtq_model(model, model_path, mxtq_seed, mxtq_bits_map,
         tq_groups[new_base] = parts
     del prestacked
     gc.collect()
+
+    # Fuse gate_proj + up_proj -> gate_up_proj when the target model expects
+    # the fused layout (oMLX glm_moe_dsa optimized module). Concat along the
+    # output-row axis (axis=1 for [n_experts, out, packed_in]); codebooks and
+    # Hadamard signs are keyed by (input_dim, bits) so they are unaffected.
+    if os.environ.get("JANGTQ_FUSE_GATE_UP", "1") != "0":
+        _fused = 0
+        for _base in [b for b in tq_groups if b.endswith("switch_mlp.gate_proj")]:
+            _prefix = _base[: -len("gate_proj")]
+            _up = _prefix + "up_proj"
+            if _up not in tq_groups:
+                continue
+            _target = _prefix + "gate_up_proj"
+            _obj = model
+            try:
+                for _part in _target.split("."):
+                    _obj = _obj[int(_part)] if _part.isdigit() else getattr(_obj, _part)
+            except Exception:
+                continue
+            _g = tq_groups[_base]; _u = tq_groups[_up]
+            if _g["bits"] != _u["bits"]:
+                continue
+            tq_groups[_target] = {
+                "packed": mx.concatenate([_g["packed"], _u["packed"]], axis=1),
+                "norms": mx.concatenate([_g["norms"], _u["norms"]], axis=1),
+                "bits": _g["bits"],
+            }
+            del tq_groups[_base], tq_groups[_up]
+            _fused += 1
+        if _fused:
+            print(f"  Fused gate+up into gate_up_proj: {_fused} layers", flush=True)
+
     print(f"  After stacking: {len(tq_groups)} TQ groups", flush=True)
 
     # Replace modules with TurboQuant variants
@@ -1334,7 +1377,10 @@ def _hydrate_jangtq_model(model, model_path, mxtq_seed, mxtq_bits_map,
             _DECODE_COMPILED[key] = mx.compile(_mlp)
             return _DECODE_COMPILED[key]
 
-        def _fused_switchglu_call(self, x, indices):
+        def _fused_switchglu_call(self, x, indices, scores=None, **_kw):
+            if scores is not None:
+                y = _fused_switchglu_call(self, x, indices)
+                return (y * scores[..., None].astype(y.dtype)).sum(axis=-2)
             # Fallback for non-TQ switch layers
             gp = self.gate_proj
             up = self.up_proj

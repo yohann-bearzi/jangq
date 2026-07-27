@@ -77,12 +77,14 @@ _HADAMARD_BUTTERFLY_SOURCE = '''
 # All threads cooperate on each block serially, staging butterfly writes
 # through registers to stay lockstep through threadgroup barriers.
 _HADAMARD_MULTIBLOCK_SOURCE = '''
-    uint batch_idx = thread_position_in_grid.y;
+    uint flat_idx = thread_position_in_grid.y;
     uint tid = thread_position_in_threadgroup.x;
     uint threads_per_tg = threads_per_threadgroup.x;
 
     uint total_d = meta[0];
     uint n_blocks = meta[1];
+    uint batch_idx = flat_idx / n_blocks;
+    uint my_block = flat_idx % n_blocks;
 
     // 8192 = max total_d we can hold in a single threadgroup's shmem
     // (32 KB / 4 bytes per float). Was 4096 → silently corrupted block 1
@@ -94,17 +96,22 @@ _HADAMARD_MULTIBLOCK_SOURCE = '''
     // Metal kernel's output has cos_sim=0.81 to the CPU reference and
     // norm ratio 0.81. Fixed by bumping shmem to 8192 floats (32 KB,
     // within Apple Silicon threadgroup memory limit).
-    threadgroup float shmem[8192];
-
-    for (uint i = tid; i < total_d; i += threads_per_tg) {
-        shmem[i] = static_cast<float>(x[batch_idx * total_d + i]) * signs[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // One threadgroup per (batch, block): only this block's slice is staged,
+    // so 4096 floats (16 KB) suffices instead of the full 8192.
+    threadgroup float shmem[4096];
 
     uint offset = 0;
-    for (uint b = 0; b < n_blocks; b++) {
+    for (uint b = 0; b < my_block; b++) offset += meta[2u + b * 2u];
+
+    {
+        uint b = my_block;
         uint d_b = meta[2u + b * 2u];
         uint log_b = meta[3u + b * 2u];
+
+        for (uint i = tid; i < d_b; i += threads_per_tg) {
+            shmem[i] = static_cast<float>(x[batch_idx * total_d + offset + i]) * signs[offset + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint ept = (d_b + threads_per_tg - 1u) / threads_per_tg;
         if (ept == 0u) ept = 1u;
@@ -119,11 +126,11 @@ _HADAMARD_MULTIBLOCK_SOURCE = '''
                 if (i_local < d_b) {
                     uint block_start = (i_local / two_h) * two_h;
                     uint pos = i_local - block_start;
-                    float a = shmem[offset + block_start + pos];
+                    float a = shmem[block_start + pos];
                     if (pos < h) {
-                        newv[k] = a + shmem[offset + block_start + pos + h];
+                        newv[k] = a + shmem[block_start + pos + h];
                     } else {
-                        newv[k] = shmem[offset + block_start + pos - h] - a;
+                        newv[k] = shmem[block_start + pos - h] - a;
                     }
                 }
             }
@@ -131,7 +138,7 @@ _HADAMARD_MULTIBLOCK_SOURCE = '''
             for (uint k = 0; k < ept; k++) {
                 uint i_local = tid * ept + k;
                 if (i_local < d_b) {
-                    shmem[offset + i_local] = newv[k];
+                    shmem[i_local] = newv[k];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -141,10 +148,11 @@ _HADAMARD_MULTIBLOCK_SOURCE = '''
         for (uint k = 0; k < ept; k++) {
             uint i_local = tid * ept + k;
             if (i_local < d_b) {
-                out[batch_idx * total_d + offset + i_local] = shmem[offset + i_local] * norm;
+                out[batch_idx * total_d + offset + i_local] = shmem[i_local] * norm;
             }
         }
-        offset += d_b;
+        // offset fixed per threadgroup; no block loop
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 '''
@@ -340,11 +348,14 @@ def hadamard_rotate_metal(x: mx.array, signs: mx.array) -> mx.array:
             meta_list.append(_next_pow2_log(d))
         meta = mx.array(meta_list, dtype=mx.uint32)
         tg_size = min(MAX_THREADS, max(blocks))
+        # One threadgroup per (batch, block): blocks are independent, so the
+        # 4096 and 2048 butterflies of a 6144 rotation run concurrently
+        # instead of serially inside a single threadgroup.
         result = mb_kernel(
             inputs=[x.astype(mx.float32), signs, meta],
             output_shapes=[x.shape],
             output_dtypes=[mx.float32],
-            grid=(tg_size, batch, 1),
+            grid=(tg_size, batch * len(blocks), 1),
             threadgroup=(tg_size, 1, 1),
         )[0]
     else:
